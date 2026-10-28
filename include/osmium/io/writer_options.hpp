@@ -33,6 +33,8 @@ DEALINGS IN THE SOFTWARE.
 
 */
 
+#include <cstddef>
+
 namespace osmium {
 
     namespace io {
@@ -52,6 +54,34 @@ namespace osmium {
             no  = false,
             yes = true
         };
+
+        /**
+         * Maximum number of entries in the queue between the output format
+         * and the thread writing to the file. Each entry is a chunk of
+         * encoded data or the future of one. A larger queue lets the
+         * writer go on while some entry at the front still waits for its
+         * encoding to finish, at the cost of more memory. This helps when
+         * writing many small chunks that are ready immediately, for
+         * instance PBF blobs written with Writer::write_pbf_blob().
+         *
+         * The default (0) is the value of the environment variable
+         * OSMIUM_MAX_OUTPUT_QUEUE_SIZE or 20 if that is not set.
+         */
+        class output_queue_size {
+
+            std::size_t m_value;
+
+        public:
+
+            explicit constexpr output_queue_size(std::size_t value = 0) noexcept :
+                m_value(value) {
+            }
+
+            constexpr std::size_t value() const noexcept {
+                return m_value;
+            }
+
+        }; // class output_queue_size
 
     } // namespace io
 

@@ -142,6 +142,17 @@ namespace osmium {
                 virtual void write_end() {
                 }
 
+                /**
+                 * Write an already encoded PBF Blob. Only the PBF output
+                 * format supports this.
+                 *
+                 * @throws osmium::unsupported_file_format_error For all other
+                 *         formats.
+                 */
+                virtual void write_pbf_blob(std::string&& /*blob*/) {
+                    throw unsupported_file_format_error{"Writing PBF blobs is only supported for PBF output"};
+                }
+
             }; // class OutputFormat
 
             /**

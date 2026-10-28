@@ -33,6 +33,9 @@ DEALINGS IN THE SOFTWARE.
 
 */
 
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -65,9 +68,11 @@ DEALINGS IN THE SOFTWARE.
 # include <osmium/io/detail/lz4.hpp>
 #endif
 
+#include <protozero/exception.hpp>
 #include <protozero/iterators.hpp>
 #include <protozero/pbf_message.hpp>
 #include <protozero/types.hpp>
+#include <protozero/varint.hpp>
 
 namespace osmium {
 
@@ -911,7 +916,20 @@ namespace osmium {
 
             }; // class PBFPrimitiveBlockDecoder
 
-            inline data_view decode_blob(const std::string& blob_data, std::string& output) {
+            /**
+             * Decode a Blob and return its (uncompressed) contents.
+             *
+             * @param blob_data The Blob.
+             * @param output Buffer for the uncompressed data.
+             * @param max_size Uncompress at most this many bytes. Use this
+             *                 to cheaply get at the beginning of a block.
+             *                 Uncompressed blobs are always returned
+             *                 completely.
+             * @returns Pointer and size of the data. If it is smaller than
+             *          max_size, it is the complete data.
+             * @throws osmium::pbf_error If the blob is invalid.
+             */
+            inline data_view decode_blob(const std::string& blob_data, std::string& output, uint64_t max_size = max_uncompressed_blob_size) {
                 int32_t raw_size = 0;
                 protozero::data_view compressed_data;
                 pbf_compression use_compression = pbf_compression::none;
@@ -966,6 +984,14 @@ namespace osmium {
                     case pbf_compression::none:
                         break;
                     case pbf_compression::zlib:
+                        if (max_size < static_cast<uint64_t>(raw_size)) {
+                            return osmium::io::detail::zlib_uncompress_prefix(
+                                compressed_data.data(),
+                                static_cast<unsigned long>(compressed_data.size()), // NOLINT(google-runtime-int)
+                                static_cast<unsigned long>(max_size), // NOLINT(google-runtime-int)
+                                output
+                            );
+                        }
                         return osmium::io::detail::zlib_uncompress_string(
                             compressed_data.data(),
                             static_cast<unsigned long>(compressed_data.size()), // NOLINT(google-runtime-int)
@@ -974,6 +1000,14 @@ namespace osmium {
                         );
                     case pbf_compression::lz4:
 #ifdef OSMIUM_WITH_LZ4
+                        if (max_size < static_cast<uint64_t>(raw_size)) {
+                            return osmium::io::detail::lz4_uncompress_prefix(
+                                compressed_data.data(),
+                                static_cast<unsigned long>(compressed_data.size()), // NOLINT(google-runtime-int)
+                                static_cast<unsigned long>(max_size), // NOLINT(google-runtime-int)
+                                output
+                            );
+                        }
                         return osmium::io::detail::lz4_uncompress_string(
                             compressed_data.data(),
                             static_cast<unsigned long>(compressed_data.size()), // NOLINT(google-runtime-int)
@@ -986,6 +1020,382 @@ namespace osmium {
                 }
                 std::abort(); // should never be here
             }
+
+            /**
+             * Reads the fields of a protobuf message like
+             * protozero::pbf_reader, but the message can be cut off
+             * anywhere. The contents of a length-delimited field are
+             * returned as far as they are available, there are no more
+             * fields after a field that is cut off.
+             */
+            class pbf_prefix_reader {
+
+                const char* m_data;
+                const char* m_end;
+                data_view m_view{};
+                uint64_t m_value = 0;
+                uint32_t m_tag_and_type = 0;
+
+            public:
+
+                explicit pbf_prefix_reader(const data_view& data) noexcept :
+                    m_data(data.data()),
+                    m_end(data.data() + data.size()) {
+                }
+
+                /**
+                 * Go to the next field.
+                 *
+                 * @returns false if there are no more fields.
+                 * @throws protozero::end_of_buffer_exception If the data
+                 *         ends in the middle of a varint.
+                 */
+                bool next() {
+                    if (m_data == m_end) {
+                        return false;
+                    }
+                    m_tag_and_type = static_cast<uint32_t>(protozero::decode_varint(&m_data, m_end));
+                    switch (static_cast<protozero::pbf_wire_type>(m_tag_and_type & 0x07U)) {
+                        case protozero::pbf_wire_type::varint:
+                            m_value = protozero::decode_varint(&m_data, m_end);
+                            break;
+                        case protozero::pbf_wire_type::length_delimited: {
+                                const auto length = protozero::decode_varint(&m_data, m_end);
+                                const auto size = std::min(length, static_cast<uint64_t>(m_end - m_data));
+                                m_view = data_view{m_data, static_cast<std::size_t>(size)};
+                                m_data += size;
+                            }
+                            break;
+                        case protozero::pbf_wire_type::fixed64:
+                            m_data += std::min(static_cast<std::ptrdiff_t>(8), m_end - m_data);
+                            break;
+                        case protozero::pbf_wire_type::fixed32:
+                            m_data += std::min(static_cast<std::ptrdiff_t>(4), m_end - m_data);
+                            break;
+                        default:
+                            throw osmium::pbf_error{"unknown pbf field type"};
+                    }
+                    return true;
+                }
+
+                /// Tag and wire type of the current field as in protozero::pbf_reader.
+                uint32_t tag_and_type() const noexcept {
+                    return m_tag_and_type;
+                }
+
+                /// The value of the current field if it is a varint.
+                uint64_t value() const noexcept {
+                    return m_value;
+                }
+
+                /// The (possibly cut off) contents of the current field if it is length-delimited.
+                data_view view() const noexcept {
+                    return m_view;
+                }
+
+            }; // class pbf_prefix_reader
+
+            /**
+             * Get type and ID of the first OSM object in a PrimitiveBlock
+             * from the beginning of its uncompressed data. This is much
+             * cheaper than decoding the whole block. Use decode_blob() with
+             * the max_size parameter to get the data.
+             *
+             * @param data The PrimitiveBlock or the beginning of it.
+             * @returns Type and ID of the first object. The type is
+             *          osmium::item_type::undefined if the data contains no
+             *          object or ends before the ID of the first object.
+             */
+            inline std::pair<osmium::item_type, osmium::object_id_type> decode_first_object_key(const data_view& data) {
+                constexpr const auto length_delimited = protozero::pbf_wire_type::length_delimited;
+                try {
+                    pbf_prefix_reader block{data};
+                    while (block.next()) {
+                        if (block.tag_and_type() != protozero::tag_and_type(OSMFormat::PrimitiveBlock::repeated_PrimitiveGroup_primitivegroup, length_delimited)) {
+                            continue;
+                        }
+                        pbf_prefix_reader group{block.view()};
+                        while (group.next()) {
+                            auto type = osmium::item_type::undefined;
+                            switch (group.tag_and_type()) {
+                                case protozero::tag_and_type(OSMFormat::PrimitiveGroup::optional_DenseNodes_dense, length_delimited): {
+                                        pbf_prefix_reader dense{group.view()};
+                                        while (dense.next()) {
+                                            if (dense.tag_and_type() == protozero::tag_and_type(OSMFormat::DenseNodes::packed_sint64_id, length_delimited) &&
+                                                !dense.view().empty()) {
+                                                const char* ids = dense.view().data();
+                                                const auto id = protozero::decode_zigzag64(protozero::decode_varint(&ids, ids + dense.view().size()));
+                                                return {osmium::item_type::node, id};
+                                            }
+                                        }
+                                    }
+                                    continue; // no nodes in DenseNodes
+                                case protozero::tag_and_type(OSMFormat::PrimitiveGroup::repeated_Node_nodes, length_delimited):
+                                    type = osmium::item_type::node;
+                                    break;
+                                case protozero::tag_and_type(OSMFormat::PrimitiveGroup::repeated_Way_ways, length_delimited):
+                                    type = osmium::item_type::way;
+                                    break;
+                                case protozero::tag_and_type(OSMFormat::PrimitiveGroup::repeated_Relation_relations, length_delimited):
+                                    type = osmium::item_type::relation;
+                                    break;
+                                default:
+                                    continue;
+                            }
+                            // The ID has tag 1 in Node, Way, and Relation.
+                            pbf_prefix_reader object{group.view()};
+                            while (object.next()) {
+                                if (object.tag_and_type() == protozero::tag_and_type(OSMFormat::Way::required_int64_id, protozero::pbf_wire_type::varint)) {
+                                    const auto value = object.value();
+                                    return {type, type == osmium::item_type::node ? protozero::decode_zigzag64(value) : static_cast<int64_t>(value)};
+                                }
+                            }
+                            return {osmium::item_type::undefined, 0};
+                        }
+                    }
+                } catch (const protozero::end_of_buffer_exception&) {
+                    // data ends in the middle of a varint
+                }
+                return {osmium::item_type::undefined, 0};
+            }
+
+            /**
+             * An OSM object in a PrimitiveBlock that has not been decoded.
+             * Only the attributes needed to order objects are available.
+             */
+            struct pbf_encoded_object {
+
+                /// The encoded Way or Relation message.
+                data_view data{};
+
+                osmium::object_id_type id = 0;
+                osmium::object_version_type version = 0;
+                osmium::Timestamp timestamp{};
+                bool visible = true;
+
+            }; // struct pbf_encoded_object
+
+            /**
+             * Access to the encoded objects of a PrimitiveBlock without
+             * decoding them into OSM objects. Together with
+             * PrimitiveBlock::add_encoded_object() this allows copying
+             * objects from one block into a new one, which is much cheaper
+             * than decoding and encoding them.
+             *
+             * This only works for blocks with a single PrimitiveGroup that
+             * contains only ways or only relations and that use the
+             * default granularities, see type().
+             */
+            class PBFEncodedPrimitiveBlock {
+
+                data_view m_stringtable{};
+                std::size_t m_stringtable_size = 0;
+                data_view m_group{};
+                osmium::item_type m_type = osmium::item_type::undefined;
+
+                static void decode_info(const data_view& data, pbf_encoded_object& object) {
+                    protozero::pbf_message<OSMFormat::Info> pbf_info{data};
+                    while (pbf_info.next()) {
+                        switch (pbf_info.tag_and_type()) {
+                            case protozero::tag_and_type(OSMFormat::Info::optional_int32_version, protozero::pbf_wire_type::varint):
+                                {
+                                    const auto version = pbf_info.get_int32();
+                                    if (version < -1) {
+                                        throw osmium::pbf_error{"object version must not be negative"};
+                                    }
+                                    object.version = version == -1 ? 0U : static_cast<object_version_type>(version);
+                                }
+                                break;
+                            case protozero::tag_and_type(OSMFormat::Info::optional_int64_timestamp, protozero::pbf_wire_type::varint):
+                                object.timestamp = osmium::Timestamp{pbf_info.get_int64()};
+                                break;
+                            case protozero::tag_and_type(OSMFormat::Info::optional_bool_visible, protozero::pbf_wire_type::varint):
+                                object.visible = pbf_info.get_bool();
+                                break;
+                            default:
+                                pbf_info.skip();
+                        }
+                    }
+                }
+
+            public:
+
+                /**
+                 * @param data The uncompressed PrimitiveBlock. Must stay
+                 *             valid as long as this object is used.
+                 */
+                explicit PBFEncodedPrimitiveBlock(const data_view& data) {
+                    bool usable = true;
+                    int stringtables = 0;
+                    int groups = 0;
+                    protozero::pbf_message<OSMFormat::PrimitiveBlock> pbf_primitive_block{data};
+                    while (pbf_primitive_block.next()) {
+                        switch (pbf_primitive_block.tag_and_type()) {
+                            case protozero::tag_and_type(OSMFormat::PrimitiveBlock::required_StringTable_stringtable, protozero::pbf_wire_type::length_delimited):
+                                ++stringtables;
+                                m_stringtable = pbf_primitive_block.get_view();
+                                break;
+                            case protozero::tag_and_type(OSMFormat::PrimitiveBlock::repeated_PrimitiveGroup_primitivegroup, protozero::pbf_wire_type::length_delimited):
+                                ++groups;
+                                m_group = pbf_primitive_block.get_view();
+                                break;
+                            case protozero::tag_and_type(OSMFormat::PrimitiveBlock::optional_int32_granularity, protozero::pbf_wire_type::varint):
+                                usable = usable && pbf_primitive_block.get_int32() == 100;
+                                break;
+                            case protozero::tag_and_type(OSMFormat::PrimitiveBlock::optional_int32_date_granularity, protozero::pbf_wire_type::varint):
+                                usable = usable && pbf_primitive_block.get_int32() == 1000;
+                                break;
+                            case protozero::tag_and_type(OSMFormat::PrimitiveBlock::optional_int64_lat_offset, protozero::pbf_wire_type::varint):
+                            case protozero::tag_and_type(OSMFormat::PrimitiveBlock::optional_int64_lon_offset, protozero::pbf_wire_type::varint):
+                                usable = usable && pbf_primitive_block.get_int64() == 0;
+                                break;
+                            default:
+                                pbf_primitive_block.skip();
+                        }
+                    }
+                    if (!usable || stringtables != 1 || groups != 1) {
+                        return;
+                    }
+
+                    protozero::pbf_message<OSMFormat::PrimitiveGroup> pbf_primitive_group{m_group};
+                    while (pbf_primitive_group.next()) {
+                        auto type = osmium::item_type::undefined;
+                        switch (pbf_primitive_group.tag_and_type()) {
+                            case protozero::tag_and_type(OSMFormat::PrimitiveGroup::repeated_Way_ways, protozero::pbf_wire_type::length_delimited):
+                                type = osmium::item_type::way;
+                                break;
+                            case protozero::tag_and_type(OSMFormat::PrimitiveGroup::repeated_Relation_relations, protozero::pbf_wire_type::length_delimited):
+                                type = osmium::item_type::relation;
+                                break;
+                            default:
+                                break;
+                        }
+                        if (type == osmium::item_type::undefined || (m_type != osmium::item_type::undefined && type != m_type)) {
+                            m_type = osmium::item_type::undefined;
+                            return;
+                        }
+                        m_type = type;
+                        pbf_primitive_group.skip();
+                    }
+
+                    protozero::pbf_message<OSMFormat::StringTable> pbf_string_table{m_stringtable};
+                    while (pbf_string_table.next(OSMFormat::StringTable::repeated_bytes_s, protozero::pbf_wire_type::length_delimited)) {
+                        pbf_string_table.skip();
+                        ++m_stringtable_size;
+                    }
+                }
+
+                /**
+                 * The type of the objects in the block: way or relation.
+                 * If this is item_type::undefined, the block can not be
+                 * used with this class.
+                 */
+                osmium::item_type type() const noexcept {
+                    return m_type;
+                }
+
+                /// The contents of the StringTable message of the block.
+                const data_view& stringtable() const noexcept {
+                    return m_stringtable;
+                }
+
+                /// The number of entries in the string table.
+                std::size_t stringtable_size() const noexcept {
+                    return m_stringtable_size;
+                }
+
+                /**
+                 * Call a function for each object in the block in the order
+                 * of the block.
+                 *
+                 * @param func Function called with a const reference to a
+                 *             pbf_encoded_object.
+                 * @pre type() is not item_type::undefined.
+                 * @throws osmium::pbf_error If an object has an invalid
+                 *         version.
+                 */
+                template <typename TFunction>
+                void for_each_object(TFunction&& func) const {
+                    assert(m_type != osmium::item_type::undefined);
+                    protozero::pbf_message<OSMFormat::PrimitiveGroup> pbf_primitive_group{m_group};
+                    while (pbf_primitive_group.next()) {
+                        pbf_encoded_object object;
+                        object.data = pbf_primitive_group.get_view();
+                        // Field numbers of ID and Info are the same in Way
+                        // and Relation.
+                        protozero::pbf_message<OSMFormat::Way> pbf_object{object.data};
+                        while (pbf_object.next()) {
+                            switch (pbf_object.tag_and_type()) {
+                                case protozero::tag_and_type(OSMFormat::Way::required_int64_id, protozero::pbf_wire_type::varint):
+                                    object.id = pbf_object.get_int64();
+                                    break;
+                                case protozero::tag_and_type(OSMFormat::Way::optional_Info_info, protozero::pbf_wire_type::length_delimited):
+                                    decode_info(pbf_object.get_view(), object);
+                                    break;
+                                default:
+                                    pbf_object.skip();
+                            }
+                        }
+                        std::forward<TFunction>(func)(static_cast<const pbf_encoded_object&>(object));
+                    }
+                }
+
+                /**
+                 * Call a function with each string table index used by an
+                 * object of this block: keys, values, user, and (for
+                 * relations) member roles. Indexes can occur several times
+                 * and they are not checked against the size of the string
+                 * table.
+                 *
+                 * @param object An object from for_each_object().
+                 * @param func Function called with each index as uint32_t.
+                 */
+                template <typename TFunction>
+                void for_each_string_index(const pbf_encoded_object& object, TFunction&& func) const {
+                    protozero::pbf_message<OSMFormat::Relation> pbf_object{object.data};
+                    while (pbf_object.next()) {
+                        switch (pbf_object.tag_and_type()) {
+                            case protozero::tag_and_type(OSMFormat::Relation::packed_uint32_keys, protozero::pbf_wire_type::length_delimited):
+                            case protozero::tag_and_type(OSMFormat::Relation::packed_uint32_vals, protozero::pbf_wire_type::length_delimited):
+                                for (const auto index : pbf_object.get_packed_uint32()) {
+                                    func(index);
+                                }
+                                break;
+                            case protozero::tag_and_type(OSMFormat::Relation::packed_uint32_keys, protozero::pbf_wire_type::varint):
+                            case protozero::tag_and_type(OSMFormat::Relation::packed_uint32_vals, protozero::pbf_wire_type::varint):
+                                func(pbf_object.get_uint32());
+                                break;
+                            case protozero::tag_and_type(OSMFormat::Relation::packed_int32_roles_sid, protozero::pbf_wire_type::length_delimited):
+                                if (m_type == osmium::item_type::relation) {
+                                    for (const auto index : pbf_object.get_packed_int32()) {
+                                        func(static_cast<uint32_t>(index));
+                                    }
+                                } else {
+                                    pbf_object.skip();
+                                }
+                                break;
+                            case protozero::tag_and_type(OSMFormat::Relation::packed_int32_roles_sid, protozero::pbf_wire_type::varint):
+                                if (m_type == osmium::item_type::relation) {
+                                    func(static_cast<uint32_t>(pbf_object.get_int32()));
+                                } else {
+                                    pbf_object.skip();
+                                }
+                                break;
+                            case protozero::tag_and_type(OSMFormat::Relation::optional_Info_info, protozero::pbf_wire_type::length_delimited):
+                                {
+                                    protozero::pbf_message<OSMFormat::Info> pbf_info{pbf_object.get_view()};
+                                    while (pbf_info.next(OSMFormat::Info::optional_uint32_user_sid, protozero::pbf_wire_type::varint)) {
+                                        func(pbf_info.get_uint32());
+                                    }
+                                }
+                                break;
+                            default:
+                                pbf_object.skip();
+                        }
+                    }
+                }
+
+            }; // class PBFEncodedPrimitiveBlock
 
             inline osmium::Box decode_header_bbox(const data_view& data) {
                     int64_t left   = std::numeric_limits<int64_t>::max();

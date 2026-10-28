@@ -217,6 +217,13 @@ namespace osmium {
                 return m_work_queue.empty();
             }
 
+            /**
+             * Is the work queue full, ie. would submit() block?
+             */
+            bool queue_full() const {
+                return m_work_queue.full();
+            }
+
             template <typename TFunction>
             using submit_func_result_type = std::invoke_result_t<TFunction>;
 

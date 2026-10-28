@@ -229,6 +229,14 @@ namespace osmium {
                 return m_queue.size();
             }
 
+            /**
+             * Is the queue full, ie. would push() block? Always false for
+             * queues without a max size.
+             */
+            bool full() const {
+                return m_max_size > 0 && size() >= m_max_size;
+            }
+
             bool in_use() const noexcept {
                 return m_in_use;
             }

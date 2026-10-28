@@ -105,7 +105,7 @@ namespace osmium {
 
             osmium::io::File m_file;
 
-            detail::future_string_queue_type m_output_queue{detail::get_output_queue_size(), "raw_output"};
+            detail::future_string_queue_type m_output_queue;
 
             std::unique_ptr<osmium::io::detail::OutputFormat> m_output{nullptr};
 
@@ -202,6 +202,7 @@ namespace osmium {
                 overwrite allow_overwrite = overwrite::no;
                 fsync sync = fsync::no;
                 osmium::thread::Pool* pool = nullptr;
+                std::size_t output_queue_size = 0;
             };
 
             static void set_option(options_type& options, osmium::thread::Pool& pool) {
@@ -218,6 +219,42 @@ namespace osmium {
 
             static void set_option(options_type& options, fsync value) {
                 options.sync = value;
+            }
+
+            static void set_option(options_type& options, output_queue_size value) {
+                options.output_queue_size = value.value();
+            }
+
+            template <typename... TArgs>
+            static options_type make_options(TArgs&&... args) {
+                options_type options;
+                (void)std::initializer_list<int>{(set_option(options, std::forward<TArgs>(args)), 0)...};
+                return options;
+            }
+
+            // The public constructors end up here once the options are
+            // known, because the output queue needs its size on construction.
+            Writer(const osmium::io::File& file, options_type&& options) :
+                m_file(file.check()),
+                m_output_queue(options.output_queue_size > 0 ? options.output_queue_size : detail::get_output_queue_size(), "raw_output") {
+                assert(!m_file.buffer()); // XXX can't handle pseudo-files
+
+                if (!options.pool) {
+                    options.pool = &thread::Pool::default_instance();
+                }
+
+                m_header = std::move(options.header);
+
+                m_output = osmium::io::detail::OutputFormatFactory::instance().create_output(*options.pool, m_file, m_output_queue);
+
+                std::unique_ptr<osmium::io::Compressor> compressor =
+                    CompressionFactory::instance().create_compressor(file.compression(),
+                                                                     osmium::io::detail::open_for_writing(m_file.filename(), options.allow_overwrite),
+                                                                     options.sync);
+
+                std::promise<std::size_t> write_promise;
+                m_write_future = write_promise.get_future();
+                m_thread = osmium::thread::thread_handler{write_thread, std::ref(m_output_queue), std::move(compressor), std::move(write_promise), &m_notification};
             }
 
             void do_close() {
@@ -260,33 +297,16 @@ namespace osmium {
              *      For instance when your program will fork, using the
              *      statically initialized pool will not work.
              *
+             * * osmium::io::output_queue_size: Maximum number of entries
+             *      in the queue between encoding and writing to the file.
+             *      See there for details.
+             *
              * @throws osmium::io_error If there was an error.
              * @throws std::system_error If the file could not be opened.
              */
             template <typename... TArgs>
             explicit Writer(const osmium::io::File& file, TArgs&&... args) :
-                m_file(file.check()) {
-                assert(!m_file.buffer()); // XXX can't handle pseudo-files
-
-                options_type options;
-                (void)std::initializer_list<int>{(set_option(options, std::forward<TArgs>(args)), 0)...};
-
-                if (!options.pool) {
-                    options.pool = &thread::Pool::default_instance();
-                }
-
-                m_header = options.header;
-
-                m_output = osmium::io::detail::OutputFormatFactory::instance().create_output(*options.pool, m_file, m_output_queue);
-
-                std::unique_ptr<osmium::io::Compressor> compressor =
-                    CompressionFactory::instance().create_compressor(file.compression(),
-                                                                     osmium::io::detail::open_for_writing(m_file.filename(), options.allow_overwrite),
-                                                                     options.sync);
-
-                std::promise<std::size_t> write_promise;
-                m_write_future = write_promise.get_future();
-                m_thread = osmium::thread::thread_handler{write_thread, std::ref(m_output_queue), std::move(compressor), std::move(write_promise), &m_notification};
+                Writer(file, make_options(std::forward<TArgs>(args)...)) {
             }
 
             template <typename... TArgs>
@@ -385,6 +405,31 @@ namespace osmium {
                         do_flush();
                         m_buffer.push_back(item);
                     }
+                });
+            }
+
+            /**
+             * Write a PBF Blob containing an OSMData block unchanged to the
+             * output file, for instance one read from another PBF file with
+             * osmium::io::detail::read_pbf_blob(). Anything written before
+             * is flushed first, so the order of the data is kept.
+             *
+             * Only works if the output format is PBF. The caller is
+             * responsible for making sure that the contents of the blob
+             * fit into the output file: The required features in the
+             * header (such as DenseNodes or HistoricalInformation), the
+             * optional features (such as LocationsOnWays), and the sort
+             * order must match.
+             *
+             * @param blob The Blob (without the BlobHeader) as raw bytes.
+             * @throws osmium::unsupported_file_format_error If the output
+             *         format is not PBF.
+             * @throws Some form of osmium::io_error when there is a problem.
+             */
+            void write_pbf_blob(std::string&& blob) {
+                ensure_cleanup([&]() {
+                    do_flush();
+                    m_output->write_pbf_blob(std::move(blob));
                 });
             }
 

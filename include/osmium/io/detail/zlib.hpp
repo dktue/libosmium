@@ -124,6 +124,44 @@ namespace osmium {
                 return protozero::data_view{output.data(), output.size()};
             }
 
+            /**
+             * Uncompress only the beginning of some data using zlib.
+             *
+             * @param input Compressed input data.
+             * @param input_size Size of compressed input data.
+             * @param max_size Uncompress at most this many bytes.
+             * @param output Uncompressed result data.
+             * @returns Pointer and size to uncompressed data. The size is
+             *          smaller than max_size only if all data was
+             *          uncompressed.
+             */
+            inline protozero::data_view zlib_uncompress_prefix(const char* input, unsigned long input_size, unsigned long max_size, std::string& output) { // NOLINT(google-runtime-int)
+                output.resize(max_size);
+
+                z_stream stream{};
+                stream.next_in = reinterpret_cast<unsigned char*>(const_cast<char*>(input)); // NOLINT(cppcoreguidelines-pro-type-const-cast) zlib API is not const-correct
+                stream.avail_in = static_cast<unsigned int>(input_size);
+                stream.next_out = reinterpret_cast<unsigned char*>(&*output.begin());
+                stream.avail_out = static_cast<unsigned int>(max_size);
+
+                auto result = ::inflateInit(&stream);
+                if (result == Z_OK) {
+                    result = ::inflate(&stream, Z_SYNC_FLUSH);
+                    ::inflateEnd(&stream);
+                    if (result == Z_OK && stream.avail_out != 0) {
+                        result = Z_DATA_ERROR; // input ended before the end of the stream
+                    }
+                }
+
+                if (result != Z_OK && result != Z_STREAM_END) {
+                    throw io_error{std::string{"failed to uncompress data: "} + zError(result)};
+                }
+
+                output.resize(max_size - stream.avail_out);
+
+                return protozero::data_view{output.data(), output.size()};
+            }
+
         } // namespace detail
 
     } // namespace io

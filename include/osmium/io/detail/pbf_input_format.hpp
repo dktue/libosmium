@@ -48,6 +48,7 @@ DEALINGS IN THE SOFTWARE.
 #include <protozero/pbf_message.hpp>
 #include <protozero/types.hpp>
 
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -62,6 +63,39 @@ namespace osmium {
     namespace io {
 
         namespace detail {
+
+            /**
+             * Decode the BlobHeader. Make sure it contains the expected
+             * type. Return the size of the following Blob.
+             */
+            inline size_t decode_blob_header(const protozero::data_view& data, const char* expected_type) {
+                protozero::pbf_message<FileFormat::BlobHeader> pbf_blob_header{data};
+                protozero::data_view blob_header_type;
+                size_t blob_header_datasize = 0;
+
+                while (pbf_blob_header.next()) {
+                    switch (pbf_blob_header.tag_and_type()) {
+                        case protozero::tag_and_type(FileFormat::BlobHeader::required_string_type, protozero::pbf_wire_type::length_delimited):
+                            blob_header_type = pbf_blob_header.get_view();
+                            break;
+                        case protozero::tag_and_type(FileFormat::BlobHeader::required_int32_datasize, protozero::pbf_wire_type::varint):
+                            blob_header_datasize = pbf_blob_header.get_int32();
+                            break;
+                        default:
+                            pbf_blob_header.skip();
+                    }
+                }
+
+                if (blob_header_datasize == 0) {
+                    throw osmium::pbf_error{"PBF format error: BlobHeader.datasize missing or zero."};
+                }
+
+                if (std::strncmp(expected_type, blob_header_type.data(), blob_header_type.size()) != 0) {
+                    throw osmium::pbf_error{"blob does not have expected type (OSMHeader in first blob, OSMData in following blobs)"};
+                }
+
+                return blob_header_datasize;
+            }
 
             class PBFParser final : public Parser {
 
@@ -140,39 +174,6 @@ namespace osmium {
                     }
 
                     return size;
-                }
-
-                /**
-                 * Decode the BlobHeader. Make sure it contains the expected
-                 * type. Return the size of the following Blob.
-                 */
-                static size_t decode_blob_header(const protozero::data_view& data, const char* expected_type) {
-                    protozero::pbf_message<FileFormat::BlobHeader> pbf_blob_header{data};
-                    protozero::data_view blob_header_type;
-                    size_t blob_header_datasize = 0;
-
-                    while (pbf_blob_header.next()) {
-                        switch (pbf_blob_header.tag_and_type()) {
-                            case protozero::tag_and_type(FileFormat::BlobHeader::required_string_type, protozero::pbf_wire_type::length_delimited):
-                                blob_header_type = pbf_blob_header.get_view();
-                                break;
-                            case protozero::tag_and_type(FileFormat::BlobHeader::required_int32_datasize, protozero::pbf_wire_type::varint):
-                                blob_header_datasize = pbf_blob_header.get_int32();
-                                break;
-                            default:
-                                pbf_blob_header.skip();
-                        }
-                    }
-
-                    if (blob_header_datasize == 0) {
-                        throw osmium::pbf_error{"PBF format error: BlobHeader.datasize missing or zero."};
-                    }
-
-                    if (std::strncmp(expected_type, blob_header_type.data(), blob_header_type.size()) != 0) {
-                        throw osmium::pbf_error{"blob does not have expected type (OSMHeader in first blob, OSMData in following blobs)"};
-                    }
-
-                    return blob_header_datasize;
                 }
 
                 size_t check_type_and_get_blob_size(const char* expected_type) {
@@ -284,6 +285,56 @@ namespace osmium {
                 }
 
             }; // class PBFParser
+
+            /**
+             * Read the next blob from a PBF file. Checks that the BlobHeader
+             * has the expected type and returns the Blob following it.
+             *
+             * This gives low-level access to the blobs in a PBF file, for
+             * instance to copy them unchanged into another PBF file using
+             * osmium::io::Writer::write_pbf_blob(). Use
+             * osmium::io::Reader for normal reading.
+             *
+             * @param fd File descriptor to read from.
+             * @param expected_type Type of the blob ("OSMHeader" for the
+             *                      first blob in a file, "OSMData" for all
+             *                      others).
+             * @returns The Blob (without the BlobHeader) or an empty string
+             *          on EOF.
+             * @throws osmium::pbf_error If the data is invalid or truncated.
+             * @throws std::system_error If reading failed.
+             */
+            inline std::string read_pbf_blob(int fd, const char* expected_type) {
+                std::array<char, sizeof(uint32_t)> size_buffer{};
+                if (!read_exactly(fd, size_buffer.data(), static_cast<unsigned int>(size_buffer.size()))) {
+                    return {}; // EOF
+                }
+
+                const auto blob_header_size = PBFParser::get_size_in_network_byte_order(size_buffer.data());
+                if (blob_header_size == 0) {
+                    return {}; // treated as EOF like in PBFParser
+                }
+                if (blob_header_size > static_cast<uint32_t>(max_blob_header_size)) {
+                    throw osmium::pbf_error{"invalid BlobHeader size (> max_blob_header_size)"};
+                }
+
+                std::string buffer(blob_header_size, '\0');
+                if (!read_exactly(fd, buffer.data(), blob_header_size)) {
+                    throw osmium::pbf_error{"unexpected EOF"};
+                }
+
+                const auto blob_size = decode_blob_header(protozero::data_view{buffer.data(), buffer.size()}, expected_type);
+                if (blob_size > max_uncompressed_blob_size) {
+                    throw osmium::pbf_error{std::string{"invalid blob size: "} + std::to_string(blob_size)};
+                }
+
+                buffer.resize(blob_size);
+                if (!read_exactly(fd, buffer.data(), static_cast<unsigned int>(blob_size))) {
+                    throw osmium::pbf_error{"unexpected EOF"};
+                }
+
+                return buffer;
+            }
 
             // we want the register_parser() function to run, setting
             // the variable is only a side-effect, it will never be used

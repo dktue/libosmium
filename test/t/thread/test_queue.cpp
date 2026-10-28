@@ -18,6 +18,26 @@ TEST_CASE("Queue can have max elements and can be named") {
     const osmium::thread::Queue<int> queue{100, "Queue of max size 100"};
 }
 
+TEST_CASE("Queue with max size is full when max size is reached") {
+    osmium::thread::Queue<int> queue{2};
+    REQUIRE_FALSE(queue.full());
+    queue.push(1);
+    REQUIRE_FALSE(queue.full());
+    queue.push(2);
+    REQUIRE(queue.full());
+    int value = 0;
+    queue.wait_and_pop(value);
+    REQUIRE_FALSE(queue.full());
+}
+
+TEST_CASE("Queue without max size is never full") {
+    osmium::thread::Queue<int> queue;
+    for (int i = 0; i < 100; ++i) {
+        queue.push(i);
+    }
+    REQUIRE_FALSE(queue.full());
+}
+
 TEST_CASE("When queue is shut down, nothing goes in or out") {
     osmium::thread::Queue<std::string> queue;
     REQUIRE(queue.in_use());

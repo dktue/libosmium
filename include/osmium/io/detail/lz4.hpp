@@ -131,6 +131,36 @@ namespace osmium {
                 return protozero::data_view{output.data(), output.size()};
             }
 
+            /**
+             * Uncompress only the beginning of some data using lz4.
+             *
+             * @param input Compressed input data.
+             * @param input_size Size of compressed input data.
+             * @param max_size Uncompress at most this many bytes.
+             * @param output Uncompressed result data.
+             * @returns Pointer and size to uncompressed data. The size is
+             *          smaller than max_size only if all data was
+             *          uncompressed.
+             */
+            inline protozero::data_view lz4_uncompress_prefix(const char* input, unsigned long input_size, unsigned long max_size, std::string& output) { // NOLINT(google-runtime-int)
+                output.resize(max_size);
+
+                const int result = ::LZ4_decompress_safe_partial( // NOLINT(google-runtime-int)
+                    input,
+                    &*output.begin(),
+                    static_cast<int>(input_size),
+                    static_cast<int>(max_size),
+                    static_cast<int>(max_size));
+
+                if (result < 0) {
+                    throw io_error{"LZ4 decompression failed: invalid block"};
+                }
+
+                output.resize(static_cast<std::size_t>(result));
+
+                return protozero::data_view{output.data(), output.size()};
+            }
+
         } // namespace detail
 
     } // namespace io

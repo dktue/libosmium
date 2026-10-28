@@ -8,11 +8,23 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* New `Writer::write_pbf_blob()` function and low-level function
+  `io::detail::read_pbf_blob()` allowing to copy blobs from one PBF file to
+  another without decoding and re-encoding them.
+* New `osmium::io::output_queue_size` option for the `Writer` to set the
+  maximum number of entries in the queue between encoding and writing.
+* New low-level function `io::detail::decode_first_object_key()` to get type
+  and ID of the first object in a PBF block, and new parameter `max_size` of
+  `io::detail::decode_blob()` to uncompress only the beginning of a blob.
+  Together they find out where a block starts much cheaper than decoding it.
+
 ### Changed
 
 * Switched to C++17 as minimum requirement
 * Removed GEOS support which has been deprecated for 10 years. It only worked
   with very old versions of GEOS.
+* The PBF writer now encodes blocks in the thread pool unless the work queue
+  of the pool is full. Before, it did this only if the work queue was empty.
 
 ### Fixed
 

@@ -179,6 +179,38 @@ TEST_CASE("Writer: Interrupted writer after write") {
     REQUIRE(count == count_fds());
 }
 
+TEST_CASE("Writer with output queue size") {
+    const int count = count_fds();
+
+    auto buffer = get_and_check_buffer();
+    const auto num = buffer.select<osmium::OSMObject>().size();
+
+    std::string filename;
+    osmium::io::output_queue_size queue_size;
+
+    SECTION("Small output queue") {
+        filename = "test-writer-out-queue-size-1.osm";
+        queue_size = osmium::io::output_queue_size{1};
+    }
+
+    SECTION("Large output queue") {
+        filename = "test-writer-out-queue-size-1000.osm";
+        queue_size = osmium::io::output_queue_size{1000};
+    }
+
+    osmium::io::Writer writer{filename, queue_size, osmium::io::overwrite::allow};
+    writer(std::move(buffer));
+    writer.close();
+
+    REQUIRE(count == count_fds());
+
+    osmium::io::Reader reader_check{filename};
+    const osmium::memory::Buffer buffer_check = reader_check.read();
+    REQUIRE(buffer_check);
+    REQUIRE(buffer_check.select<osmium::OSMObject>().size() == num);
+    REQUIRE(buffer_check.select<osmium::OSMObject>().cbegin()->id() == 1);
+}
+
 TEST_CASE("Writer with user-provided pool with default number of threads") {
     const int count = count_fds();
 
